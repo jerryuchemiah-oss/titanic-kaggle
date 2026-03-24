@@ -39,12 +39,13 @@ except ImportError:
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from src.features import engineer_features
+from src.features import fit_transform
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 DATA_PATH = ROOT / "data" / "raw" / "train.csv"
 MODEL_DIR = ROOT / "models"
 MODEL_PATH = MODEL_DIR / "best_model.pkl"
+ENCODERS_PATH = MODEL_DIR / "encoders.pkl"
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -145,7 +146,9 @@ def main() -> None:
     raw = pd.read_csv(DATA_PATH)
     print(f"Raw shape: {raw.shape}")
 
-    df = engineer_features(raw, is_train=True)
+    df, encoders = fit_transform(raw)
+    joblib.dump(encoders, ENCODERS_PATH)
+    print(f"Encoders saved to: {ENCODERS_PATH}")
     X = df.drop(columns=["Survived"])
     y = df["Survived"]
     feature_names = list(X.columns)

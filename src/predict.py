@@ -18,11 +18,12 @@ import joblib
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from src.features import engineer_features
+from src.features import transform
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 TEST_PATH = ROOT / "data" / "raw" / "test.csv"
 MODEL_DIR = ROOT / "models"
+ENCODERS_PATH = MODEL_DIR / "encoders.pkl"
 SUBMISSION_DIR = ROOT / "submissions"
 SUBMISSION_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -46,7 +47,8 @@ def main() -> None:
     raw_test = pd.read_csv(TEST_PATH)
     print(f"Test shape : {raw_test.shape}")
 
-    df_test = engineer_features(raw_test, is_train=False)
+    encoders = joblib.load(ENCODERS_PATH)
+    df_test = transform(raw_test, encoders)
     passenger_ids = df_test["PassengerId"]
     X_test_full = df_test.drop(columns=["PassengerId"])
 
@@ -109,7 +111,7 @@ def main() -> None:
 
     # ── Save submission ────────────────────────────────────────────────────────
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    submission_path = SUBMISSION_DIR / f"submission_v2_{timestamp}.csv"
+    submission_path = SUBMISSION_DIR / f"submission_v3_{timestamp}.csv"
     submission.to_csv(submission_path, index=False)
 
     print(f"\nSubmission saved to: {submission_path}")

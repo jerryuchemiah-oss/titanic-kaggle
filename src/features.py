@@ -1,13 +1,14 @@
 """
 Feature engineering pipeline for the Titanic Kaggle competition.
+
+Encoders are fitted on training data and must be passed to transform test data,
+ensuring train/test encoding consistency.
 """
 
 import pandas as pd
 import numpy as np
-from sklearn.preprocessing import LabelEncoder
+from sklearn.preprocessing import OrdinalEncoder
 
-
-# Title groups for better consolidation
 _TITLE_MAP = {
     "Mlle": "Miss",
     "Ms": "Miss",
@@ -18,11 +19,11 @@ _ROYAL_TITLES = {"Lady", "Countess", "Sir", "Jonkheer", "Don", "Dona", "the Coun
 _MILITARY_TITLES = {"Capt", "Col", "Major"}
 _ACADEMIC_TITLES = {"Dr", "Rev"}
 
+CAT_COLS = ["Sex", "Embarked", "Title", "AgeGroup", "FareBin", "Deck"]
+
 
 def extract_title(name: str) -> str:
-    """Extract and normalize title from passenger name."""
     title = name.split(",")[1].split(".")[0].strip()
-
     if title in _TITLE_MAP:
         return _TITLE_MAP[title]
     if title in _ROYAL_TITLES or title in _MILITARY_TITLES or title in _ACADEMIC_TITLES:
@@ -31,101 +32,106 @@ def extract_title(name: str) -> str:
 
 
 def extract_deck(cabin) -> str:
-    """Extract deck letter from Cabin value; return 'Unknown' if missing."""
     if pd.isna(cabin) or cabin == "":
         return "Unknown"
     return str(cabin)[0]
 
 
-def engineer_features(df: pd.DataFrame, is_train: bool = True) -> pd.DataFrame:
-    """
-    Apply the full feature engineering pipeline.
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Raw dataframe (train or test).
-    is_train : bool
-        If True, PassengerId is dropped along with other ID-like columns.
-        If False (test set), PassengerId is retained for submission assembly.
-
-    Returns
-    -------
-    pd.DataFrame
-        Clean, model-ready dataframe.
-    """
+def _base_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Apply all feature transformations that don't require fitting."""
     df = df.copy()
 
-    # --- PassengerId ---
-    passenger_ids = df["PassengerId"].copy() if not is_train else None
-
-    # --- Title ---
     df["Title"] = df["Name"].apply(extract_title)
-
-    # --- Deck: extract from Cabin before dropping ---
     df["Deck"] = df["Cabin"].apply(extract_deck)
+    df["TicketFreq"] = df["Ticket"].map(df["Ticket"].value_counts()).fillna(1).astype(int)
 
-    # --- TicketFreq: number of passengers sharing the same ticket ---
-    ticket_counts = df["Ticket"].map(df["Ticket"].value_counts())
-    df["TicketFreq"] = ticket_counts.fillna(1).astype(int)
-
-    # --- Missing Age: fill with median grouped by Pclass + Sex ---
     age_medians = df.groupby(["Pclass", "Sex"])["Age"].transform("median")
-    df["Age"] = df["Age"].fillna(age_medians)
-    # Fallback for any remaining NaN (e.g. group is entirely NaN)
-    df["Age"] = df["Age"].fillna(df["Age"].median())
-
-    # --- Missing Embarked: fill with mode ---
+    df["Age"] = df["Age"].fillna(age_medians).fillna(df["Age"].median())
     df["Embarked"] = df["Embarked"].fillna(df["Embarked"].mode()[0])
-
-    # --- Missing Fare: fill with median ---
     df["Fare"] = df["Fare"].fillna(df["Fare"].median())
 
-    # --- FamilySize ---
     df["FamilySize"] = df["SibSp"] + df["Parch"] + 1
-
-    # --- IsAlone ---
     df["IsAlone"] = (df["FamilySize"] == 1).astype(int)
-
-    # --- IsChild: age < 16 ---
     df["IsChild"] = (df["Age"] < 16).astype(int)
-
-    # --- IsMother: female, age > 18, has children (Parch > 0), not Miss ---
     df["IsMother"] = (
         (df["Sex"] == "female")
         & (df["Age"] > 18)
         & (df["Parch"] > 0)
         & (df["Title"] != "Miss")
     ).astype(int)
-
-    # --- AgePclass: interaction feature ---
     df["AgePclass"] = df["Age"] * df["Pclass"]
-
-    # --- FarePerPerson ---
     df["FarePerPerson"] = df["Fare"] / df["FamilySize"]
 
-    # --- AgeGroup ---
     df["AgeGroup"] = pd.cut(
         df["Age"],
         bins=[0, 12, 18, 35, 60, 120],
         labels=["Child", "Teen", "YoungAdult", "Adult", "Senior"],
-    )
+    ).astype(str)
 
-    # --- FareBin ---
-    df["FareBin"] = pd.qcut(df["Fare"], q=4, labels=["Low", "Medium", "High", "VeryHigh"])
+    return df
 
-    # --- Encode categoricals ---
-    le = LabelEncoder()
-    for col in ["Sex", "Embarked", "Title", "AgeGroup", "FareBin", "Deck"]:
-        df[col] = le.fit_transform(df[col].astype(str))
 
-    # --- Drop columns not useful for modelling ---
-    # Drop Ticket and Cabin (already extracted), SibSp and Parch (FamilySize captures them)
+def fit_transform(df: pd.DataFrame) -> tuple:
+    """
+    Fit encoders on training data and return (transformed_df, encoders).
+
+    Parameters
+    ----------
+    df : raw training DataFrame (must contain 'Survived')
+
+    Returns
+    -------
+    (X_df, encoders) where encoders is a dict to pass to transform()
+    """
+    df = _base_features(df)
+    passenger_ids = df["PassengerId"].copy()
+
+    # Fit FareBin quantile bins from training data
+    _, fare_bins = pd.qcut(df["Fare"], q=4, labels=False, retbins=True)
+    fare_bins[0] = -np.inf
+    fare_bins[-1] = np.inf
+    df["FareBin"] = pd.cut(
+        df["Fare"], bins=fare_bins, labels=["Low", "Medium", "High", "VeryHigh"]
+    ).astype(str)
+
+    # Fit OrdinalEncoder on training data (handles unseen categories gracefully)
+    enc = OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1, dtype=float)
+    df[CAT_COLS] = enc.fit_transform(df[CAT_COLS].astype(str))
+
+    encoders = {"ordinal": enc, "fare_bins": fare_bins}
+
     drop_cols = ["Name", "Ticket", "Cabin", "PassengerId", "SibSp", "Parch"]
     df = df.drop(columns=[c for c in drop_cols if c in df.columns])
 
-    if not is_train:
-        # Reattach PassengerId for later submission assembly
-        df["PassengerId"] = passenger_ids.values
+    return df, encoders
 
+
+def transform(df: pd.DataFrame, encoders: dict) -> pd.DataFrame:
+    """
+    Apply fitted encoders to test data.
+
+    Parameters
+    ----------
+    df       : raw test DataFrame
+    encoders : dict returned by fit_transform()
+
+    Returns
+    -------
+    Transformed DataFrame with PassengerId retained.
+    """
+    df = _base_features(df)
+    passenger_ids = df["PassengerId"].copy()
+
+    fare_bins = encoders["fare_bins"]
+    df["FareBin"] = pd.cut(
+        df["Fare"], bins=fare_bins, labels=["Low", "Medium", "High", "VeryHigh"]
+    ).astype(str)
+
+    enc = encoders["ordinal"]
+    df[CAT_COLS] = enc.transform(df[CAT_COLS].astype(str))
+
+    drop_cols = ["Name", "Ticket", "Cabin", "PassengerId", "SibSp", "Parch"]
+    df = df.drop(columns=[c for c in drop_cols if c in df.columns])
+
+    df["PassengerId"] = passenger_ids.values
     return df
