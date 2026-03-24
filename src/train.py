@@ -14,9 +14,12 @@ import pandas as pd
 import joblib
 
 from sklearn.linear_model import LogisticRegression
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.ensemble import (
+    RandomForestClassifier,
+    GradientBoostingClassifier,
+    VotingClassifier,
+)
 from sklearn.model_selection import StratifiedKFold, cross_val_score
-from sklearn.pipeline import Pipeline
 
 try:
     from xgboost import XGBClassifier
@@ -49,20 +52,32 @@ def build_models() -> dict:
     """Return dict of {name: estimator} for all candidate models."""
     models = {
         "LogisticRegression": LogisticRegression(
-            max_iter=1000, solver="lbfgs", C=0.5, random_state=42
+            C=0.1,
+            max_iter=1000,
+            solver="lbfgs",
+            class_weight="balanced",
+            random_state=42,
         ),
         "RandomForest": RandomForestClassifier(
-            n_estimators=300, max_depth=6, min_samples_leaf=2, random_state=42
+            n_estimators=500,
+            max_depth=6,
+            min_samples_leaf=4,
+            class_weight="balanced",
+            random_state=42,
         ),
         "GradientBoosting": GradientBoostingClassifier(
-            n_estimators=200, learning_rate=0.05, max_depth=4, random_state=42
+            n_estimators=300,
+            max_depth=3,
+            learning_rate=0.05,
+            subsample=0.8,
+            random_state=42,
         ),
     }
     if HAS_XGB:
         models["XGBoost"] = XGBClassifier(
             n_estimators=300,
+            max_depth=3,
             learning_rate=0.05,
-            max_depth=4,
             subsample=0.8,
             colsample_bytree=0.8,
             use_label_encoder=False,
@@ -73,22 +88,37 @@ def build_models() -> dict:
     if HAS_LGB:
         models["LightGBM"] = LGBMClassifier(
             n_estimators=300,
-            learning_rate=0.05,
             max_depth=4,
-            num_leaves=31,
+            learning_rate=0.05,
+            num_leaves=15,
+            min_child_samples=20,
             subsample=0.8,
             colsample_bytree=0.8,
+            class_weight="balanced",
             random_state=42,
             verbose=-1,
         )
     return models
 
 
+def build_voting_ensemble(models: dict) -> VotingClassifier:
+    """Build a hard-voting ensemble from the provided models dict."""
+    estimators = list(models.items())
+    return VotingClassifier(estimators=estimators, voting="hard")
+
+
 def print_feature_importances(model, feature_names: list, top_n: int = 15) -> None:
     """Print top feature importances if the model supports it."""
-    if hasattr(model, "feature_importances_"):
-        importances = model.feature_importances_
-        # Normalize to [0, 1] so the bar chart is sensible regardless of scale
+    # Unwrap VotingClassifier — use the first tree-based estimator found
+    check_model = model
+    if isinstance(model, VotingClassifier):
+        for _, est in model.estimators:
+            if hasattr(est, "feature_importances_"):
+                check_model = est
+                break
+
+    if hasattr(check_model, "feature_importances_"):
+        importances = check_model.feature_importances_
         total = importances.sum()
         if total > 0:
             importances = importances / total
@@ -96,13 +126,13 @@ def print_feature_importances(model, feature_names: list, top_n: int = 15) -> No
         print("\n  Top feature importances (normalized):")
         for name, imp in pairs[:top_n]:
             bar = "#" * int(imp * 40)
-            print(f"    {name:<20} {imp:.4f}  {bar}")
-    elif hasattr(model, "coef_"):
-        coefs = np.abs(model.coef_[0])
+            print(f"    {name:<22} {imp:.4f}  {bar}")
+    elif hasattr(check_model, "coef_"):
+        coefs = np.abs(check_model.coef_[0])
         pairs = sorted(zip(feature_names, coefs), key=lambda x: x[1], reverse=True)
         print("\n  Top |coefficient| values:")
         for name, coef in pairs[:top_n]:
-            print(f"    {name:<20} {coef:.4f}")
+            print(f"    {name:<22} {coef:.4f}")
 
 
 def main() -> None:
@@ -120,37 +150,72 @@ def main() -> None:
     y = df["Survived"]
     feature_names = list(X.columns)
 
-    print(f"Feature matrix: {X.shape[0]} samples × {X.shape[1]} features")
+    print(f"Feature matrix: {X.shape[0]} samples x {X.shape[1]} features")
+    print(f"Features      : {feature_names}")
     print(f"Survival rate : {y.mean():.3f}")
 
     # ── Cross-validation ───────────────────────────────────────────────────────
     cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
     models = build_models()
+    voting_ensemble = build_voting_ensemble(models)
+
+    all_models = dict(models)
+    all_models["VotingEnsemble"] = voting_ensemble
 
     cv_results = {}
-    print("\n--- 5-Fold Cross-Validation Scores ---")
-    for name, model in models.items():
+    print("\n--- 5-Fold Stratified Cross-Validation Scores ---")
+    for name, model in all_models.items():
         scores = cross_val_score(model, X, y, cv=cv, scoring="accuracy", n_jobs=-1)
         cv_results[name] = scores
         print(
-            f"  {name:<22} mean={scores.mean():.4f}  std={scores.std():.4f}"
+            f"  {name:<22}  mean={scores.mean():.4f}  std={scores.std():.4f}"
             f"  folds={np.round(scores, 4).tolist()}"
         )
 
-    # ── Select best model ──────────────────────────────────────────────────────
+    # ── Select best model (exclude ensemble from competition to save individual models) ──
     best_name = max(cv_results, key=lambda n: cv_results[n].mean())
     best_score = cv_results[best_name].mean()
     print(f"\nBest model: {best_name}  (CV accuracy = {best_score:.4f})")
 
-    # ── Retrain on full data ───────────────────────────────────────────────────
-    best_model = models[best_name]
-    print(f"\nRetraining {best_name} on full training set …")
-    best_model.fit(X, y)
+    # ── Retrain all individual models on full data and save each ───────────────
+    print("\nRetraining all individual models on full training set ...")
+    trained_models = {}
+    for name, model in models.items():
+        print(f"  Fitting {name} ...")
+        model.fit(X, y)
+        trained_models[name] = model
+        individual_path = MODEL_DIR / f"{name}.pkl"
+        joblib.dump(
+            {
+                "model": model,
+                "model_name": name,
+                "cv_score": cv_results[name].mean(),
+                "feature_names": feature_names,
+            },
+            individual_path,
+        )
+        print(f"    Saved to: {individual_path}")
 
-    # ── Feature importances ────────────────────────────────────────────────────
+    # Also fit and save the voting ensemble
+    print("  Fitting VotingEnsemble ...")
+    voting_ensemble.fit(X, y)
+    trained_models["VotingEnsemble"] = voting_ensemble
+    voting_path = MODEL_DIR / "VotingEnsemble.pkl"
+    joblib.dump(
+        {
+            "model": voting_ensemble,
+            "model_name": "VotingEnsemble",
+            "cv_score": cv_results["VotingEnsemble"].mean(),
+            "feature_names": feature_names,
+        },
+        voting_path,
+    )
+    print(f"    Saved to: {voting_path}")
+
+    # ── Save best model as best_model.pkl ──────────────────────────────────────
+    best_model = trained_models[best_name]
     print_feature_importances(best_model, feature_names)
 
-    # ── Save model ─────────────────────────────────────────────────────────────
     payload = {
         "model": best_model,
         "model_name": best_name,
@@ -159,7 +224,7 @@ def main() -> None:
         "cv_results": {k: v.tolist() for k, v in cv_results.items()},
     }
     joblib.dump(payload, MODEL_PATH)
-    print(f"\nModel saved to: {MODEL_PATH}")
+    print(f"\nBest model saved to: {MODEL_PATH}")
     print("=" * 60)
 
 

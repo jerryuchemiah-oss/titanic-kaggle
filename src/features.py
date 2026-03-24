@@ -7,23 +7,34 @@ import numpy as np
 from sklearn.preprocessing import LabelEncoder
 
 
+# Title groups for better consolidation
+_TITLE_MAP = {
+    "Mlle": "Miss",
+    "Ms": "Miss",
+    "Mme": "Mrs",
+}
+
+_ROYAL_TITLES = {"Lady", "Countess", "Sir", "Jonkheer", "Don", "Dona", "the Countess"}
+_MILITARY_TITLES = {"Capt", "Col", "Major"}
+_ACADEMIC_TITLES = {"Dr", "Rev"}
+
+
 def extract_title(name: str) -> str:
     """Extract and normalize title from passenger name."""
     title = name.split(",")[1].split(".")[0].strip()
-    rare_titles = {
-        "Lady", "Countess", "Capt", "Col", "Don", "Dr",
-        "Major", "Rev", "Sir", "Jonkheer", "Dona",
-    }
-    title_map = {
-        "Mlle": "Miss",
-        "Ms": "Miss",
-        "Mme": "Mrs",
-    }
-    if title in title_map:
-        return title_map[title]
-    if title in rare_titles:
+
+    if title in _TITLE_MAP:
+        return _TITLE_MAP[title]
+    if title in _ROYAL_TITLES or title in _MILITARY_TITLES or title in _ACADEMIC_TITLES:
         return "Rare"
     return title
+
+
+def extract_deck(cabin) -> str:
+    """Extract deck letter from Cabin value; return 'Unknown' if missing."""
+    if pd.isna(cabin) or cabin == "":
+        return "Unknown"
+    return str(cabin)[0]
 
 
 def engineer_features(df: pd.DataFrame, is_train: bool = True) -> pd.DataFrame:
@@ -51,6 +62,13 @@ def engineer_features(df: pd.DataFrame, is_train: bool = True) -> pd.DataFrame:
     # --- Title ---
     df["Title"] = df["Name"].apply(extract_title)
 
+    # --- Deck: extract from Cabin before dropping ---
+    df["Deck"] = df["Cabin"].apply(extract_deck)
+
+    # --- TicketFreq: number of passengers sharing the same ticket ---
+    ticket_counts = df["Ticket"].map(df["Ticket"].value_counts())
+    df["TicketFreq"] = ticket_counts.fillna(1).astype(int)
+
     # --- Missing Age: fill with median grouped by Pclass + Sex ---
     age_medians = df.groupby(["Pclass", "Sex"])["Age"].transform("median")
     df["Age"] = df["Age"].fillna(age_medians)
@@ -69,6 +87,23 @@ def engineer_features(df: pd.DataFrame, is_train: bool = True) -> pd.DataFrame:
     # --- IsAlone ---
     df["IsAlone"] = (df["FamilySize"] == 1).astype(int)
 
+    # --- IsChild: age < 16 ---
+    df["IsChild"] = (df["Age"] < 16).astype(int)
+
+    # --- IsMother: female, age > 18, has children (Parch > 0), not Miss ---
+    df["IsMother"] = (
+        (df["Sex"] == "female")
+        & (df["Age"] > 18)
+        & (df["Parch"] > 0)
+        & (df["Title"] != "Miss")
+    ).astype(int)
+
+    # --- AgePclass: interaction feature ---
+    df["AgePclass"] = df["Age"] * df["Pclass"]
+
+    # --- FarePerPerson ---
+    df["FarePerPerson"] = df["Fare"] / df["FamilySize"]
+
     # --- AgeGroup ---
     df["AgeGroup"] = pd.cut(
         df["Age"],
@@ -81,11 +116,12 @@ def engineer_features(df: pd.DataFrame, is_train: bool = True) -> pd.DataFrame:
 
     # --- Encode categoricals ---
     le = LabelEncoder()
-    for col in ["Sex", "Embarked", "Title", "AgeGroup", "FareBin"]:
+    for col in ["Sex", "Embarked", "Title", "AgeGroup", "FareBin", "Deck"]:
         df[col] = le.fit_transform(df[col].astype(str))
 
     # --- Drop columns not useful for modelling ---
-    drop_cols = ["Name", "Ticket", "Cabin", "PassengerId"]
+    # Drop Ticket and Cabin (already extracted), SibSp and Parch (FamilySize captures them)
+    drop_cols = ["Name", "Ticket", "Cabin", "PassengerId", "SibSp", "Parch"]
     df = df.drop(columns=[c for c in drop_cols if c in df.columns])
 
     if not is_train:
